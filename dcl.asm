@@ -1,4 +1,29 @@
 %assign	ALPHABET_SIZE	42
+%assign BUFFER_SIZE	4096
+
+
+%macro permute 2
+	add	al, %2
+	cmp	al, ALPHABET_SIZE
+	jl	%%dont_sub
+	sub	al, ALPHABET_SIZE
+%%dont_sub:
+
+	mov	al, [%1 + rax]
+
+	sub	al, %2
+	jnl	%%dont_add
+	add	al, ALPHABET_SIZE
+%%dont_add:
+%endmacro
+
+
+%macro check_char 1
+	cmp	%1, '1'
+	jb	error
+	cmp	%1, 'Z'
+	ja	error
+%endmacro
 
 
 section .text
@@ -25,6 +50,81 @@ _start:
 	mov	r9, tperm_rev
 	call	process_permutation
 
+	;; initial positions
+	mov	rbx, [rsp+5*8]
+	mov	bx, [rbx]
+
+	check_char bl
+	check_char bh
+	sub	bl, '1'
+	sub	bh, '1'
+
+.loop:
+	;; read a portion of stdin into buffer
+	mov	rsi, buffer
+	xor	eax, eax
+	xor	edi, edi
+	mov	edx, BUFFER_SIZE
+	syscall
+
+	;; if there're no characters to be read, exit
+	cmp	eax, 0
+	je	.end
+
+	mov	ecx, eax
+	mov	edx, eax
+	xor	eax, eax
+.inner_loop:
+
+	;; rotate the right rotor
+	inc	bh
+	cmp	bh, ALPHABET_SIZE
+	jne	.dont_zero_right
+	xor	bh, bh
+.dont_zero_right:
+
+	;; check whether to rotate the left rotor
+	cmp	bh, 'L' - '1'
+	je	.inc_left
+	cmp	bh, 'R' - '1'
+	je	.inc_left
+	cmp	bh, 'T' - '1'
+	je	.inc_left
+	jmp	.dont_inc_left
+.inc_left:
+	;; rotate the left rotor
+	inc	bl
+	cmp	bl, ALPHABET_SIZE
+	jne	.dont_zero_left
+	xor	bl, bl
+.dont_zero_left:
+.dont_inc_left:
+
+	mov	al, [rsi]
+	sub	al, '1'
+
+	;; perform the permutations
+	permute	rperm, bh
+	permute	lperm, bl
+	mov	al, [tperm + rax]
+	permute lperm_rev, bl
+	permute rperm_rev, bh
+
+	add	al, '1'
+	mov	[rsi], al
+
+	inc	rsi
+	dec	ecx
+	jnz	.inner_loop
+
+	mov	eax, 1
+	mov	rsi, buffer
+	mov	edi, 1
+	syscall
+
+	jmp	.loop
+
+.end:
 	;; exit with code 0
 	mov	eax, 60
 	xor	edi, edi
@@ -80,7 +180,7 @@ process_permutation:
 	jne	error
 
 	;; set the corresponding value in the reverse permutation
-	mov	[r9 + rax], al
+	mov	[r9 + rax], cl
 
 	inc	ecx
 	cmp	ecx, ALPHABET_SIZE
@@ -116,3 +216,6 @@ tperm:
 
 tperm_rev:
 	resb	ALPHABET_SIZE
+
+buffer:
+	resb	BUFFER_SIZE
