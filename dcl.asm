@@ -11,37 +11,23 @@
 ;;; actuall ascii values in order to avoid repeated subtracting needed
 ;;; to convert ascii values to indexes in permutation.
 
+;;; Each permutation (L, L^-1, R, R^-1, T) is saved in .bss section
+;;; in 3 copies. One of the copies is the main copy, and the two other
+;;; copies are placed just before and after it in the memory.
+;;; This makes it possible to permform shift permutations (Q_l, Q_r)
+;;; simply by adding/subtracting values l/r from the index
+;;; without checking if it becomes negative or exceeds 41,
+;;; thus removing a lot of conditional jums, which improves
+;;; speeds up encryption quite a lot. For example if 'perm' is the address
+;;; of the middle of those three copies then perm[-1] == perm[41],
+;;; perm[45] == perm[3] (even though the permuation has only 42 elements).
 
 
-%assign	ALPHABET_SIZE	42	; 'Z' - '1'
+%assign	N		42	; 'Z' - '1'
 %assign BUFFER_SIZE	4096
 
 
-
-;;; Performs a cyclic shift, permutation and a reverse cyclic shift
-;;; on the value stored in AL (has to be in range 0-41).
-;;; First argument is the address of the permuation (encoded as described
-;;; above) and the second is the shift parameter (a shift with parameter
-;;; 2 shifts 'A' to 'C'; parameter = 0 means no shift).
-;;; Arguments can be literal values or registers.
-%macro permute 2
-	add	al, %2
-	cmp	al, ALPHABET_SIZE
-	jb	%%dont_sub
-	sub	al, ALPHABET_SIZE
-%%dont_sub:
-
-	mov	al, [%1 + rax]
-
-	sub	al, %2
-	jae	%%dont_add
-	add	al, ALPHABET_SIZE
-%%dont_add:
-%endmacro
-
-
-
-;;; Check if the value of the first argument (literal or a register)
+;;; Check if the value of the first argument
 ;;; is a character from '1' to 'Z' in ascii.
 %macro check_char 1
 	cmp	%1, '1'
@@ -51,9 +37,7 @@
 %endmacro
 
 
-
 section .text
-
 
 	global 	_start
 _start:
@@ -80,18 +64,30 @@ _start:
 	mov	rsi, [rsp+4*8]
 	call	process_t
 
-	;; save the initial positions of rotors in bx
-	;; - left rotor in bl, right in bh
-	mov	rbx, [rsp+5*8]
-	mov	bx, [rbx]
+	;; save the initial positions of rotors
+	;; - left rotor in r12, right in r13
+	xor	r12, r12
+	xor	r13, r13
+	mov	rsi, [rsp+5*8]
+
+	;; check if the key has length 2
+	cmp	byte [rsi], 0
+	je	error
+	cmp 	byte [rsi+1], 0
+	je	error
+	cmp	byte [rsi+2], 0
+	jne	error
+
+	mov	r12b, [rsi]
+	mov	r13b, [rsi+1]
 
 	;; check if the initial positions are permitted characters
-	check_char bl
-	check_char bh
+	check_char r12b
+	check_char r13b
 
 	;; convert ascii values to shift parameters
-	sub	bl, '1'
-	sub	bh, '1'
+	sub	r12b, '1'
+	sub	r13b, '1'
 
 .loop:
 	;; read a portion of stdin into buffer
@@ -101,11 +97,14 @@ _start:
 	mov	edx, BUFFER_SIZE
 	syscall
 
+	;; save	addres of the buffer in rdi (to be used by stosb)
+	mov	rdi, buffer
+
 	;; if there're no characters left, exit
 	cmp	eax, 0
 	je	.end
 
-	;; store the number of characters in rax
+	;; store the number of characters in rcx
 	;; (it will be used as a counter in the loop)
 	;; and in rdx (it will be used as an argument to sys_write)
 	mov	ecx, eax
@@ -118,53 +117,81 @@ _start:
 	;; a loop processing each character in the buffer
 .inner_loop:
 	;; rotate the right rotor
-	inc	bh
-	cmp	bh, ALPHABET_SIZE
+	inc	r13b
+	cmp	r13b, N
 	jne	.dont_zero_right
-	xor	bh, bh
+	xor	r13b, r13b
 .dont_zero_right:
 
 	;; check whether to rotate the left rotor
-	cmp	bh, 'L' - '1'
+	cmp	r13b, 'L' - '1'
 	je	.inc_left
-	cmp	bh, 'R' - '1'
+	cmp	r13b, 'R' - '1'
 	je	.inc_left
-	cmp	bh, 'T' - '1'
+	cmp	r13b, 'T' - '1'
 	je	.inc_left
 	jmp	.dont_inc_left
 .inc_left:
 	;; rotate the left rotor
-	inc	bl
-	cmp	bl, ALPHABET_SIZE
+	inc	r12b
+	cmp	r12b, N
 	jne	.dont_zero_left
-	xor	bl, bl
+	xor	r12b, r12b
 .dont_zero_left:
 .dont_inc_left:
 
 	;; load the next character and check if it's in range
 	;; from '1' to 'Z' in ascii
-	mov	al, [rsi]
+	lodsb
 	check_char al
 
 	;; convert ascii value to permutation index
 	sub	al, '1'
 
 	;; perform the permutations
-	permute	rperm, bh
-	permute	lperm, bl
-	mov	al, [tperm + rax]
-	permute lperm_rev, bl
-	permute rperm_rev, bh
+
+	;; R
+	add	rax, r13
+	mov	al, [rperm + N + rax]
+	sub	rax, r13
+
+	;; L
+	add	rax, r12
+	mov	al, [lperm + N + rax]
+	;; clean higher bytes of rax that are set because of last subtraction
+	and	rax, 0xff
+	sub	rax, r12
+
+	;; T
+	mov	al, [tperm + N + rax]
+	;; clean higher bytes of rax that are set because of last subtraction
+	and	rax, 0xff
+
+	;; L^-1
+	add	rax, r12
+	mov	al, [lperm_rev + N + rax]
+	sub	rax, r12
+
+	;; R^-1
+	add	rax, r13
+	mov	al, [rperm_rev + N + rax]
+	;; clean higher bytes of rax filled because of subtraction
+	and	rax, 0xff
+	sub	rax, r13
+
+	;; check if the subtraction didn't make the value negative
+	jge	.dont_add_n
+	add	rax, N
+.dont_add_n:
 
 	;; convert permutation index back to ascii
 	add	al, '1'
 
 	;; save the output result back to buffer
-	mov	[rsi], al
+	stosb
 
-	;; move pointer to the next character, decrease counter,
-	;; check if there are more characters in buffer to process
-	inc	rsi
+	;; decrease counter, check if there are more
+	;; characters in buffer to process
 	dec	ecx
 	jnz	.inner_loop
 
@@ -186,24 +213,24 @@ _start:
 
 
 ;;; Checks if a zero-terminated string, a pointer to which
-;;; is passed in rsi has length ALPHABET_SIZE.
+;;; is passed in rsi has length N.
 check_permutation_length:
 	mov	rdi, rsi
 
-	;; we expect '\0' at the position ALPHABET_SIZE, so the search
+	;; we expect '\0' at the position N, so the search
 	;; for '\0' shouldn't stop until we pass this position
-	mov	ecx, ALPHABET_SIZE + 2
+	mov	ecx, N + 2
 
 	;; al holds the value to be searched for - 0
 	xor	al, al
 
-	repne scasb
+	repne \
+	scasb
 
 	;; if the string has incorrect length exit with error code
 	sub	rdi, rsi
-	cmp	rdi, ALPHABET_SIZE + 1
+	cmp	rdi, N + 1
 	jne 	error
-
 	ret
 
 
@@ -222,16 +249,16 @@ process_l_or_r:
 
 	;; fill the space reserved for the reverse permutation with values -1
 	mov	rdi, r9
-	mov	ecx, 42
+	mov	ecx, N
 	mov	al, -1
 	rep stosb
 
 	;; store the desired location of the resulting permutation in rdi
 	mov	rdi, r8
 
-	;; zero ecx (used as a counter in the loop) and eax
+	;; zero cl (used as a counter in the loop) and eax
 	;; (al is used to store characters)
-	xor	ecx, ecx
+	xor	cl, cl
 	xor	eax, eax
 .loop:
 	;; load a character from [rsi] to al, increment rsi
@@ -257,10 +284,16 @@ process_l_or_r:
 	mov	[r9 + rax], cl
 
 	;; increment the counter and if there are characters left, repeat
-	inc	ecx
-	cmp	ecx, ALPHABET_SIZE
+	inc	cl
+	cmp	cl, N
 	jne	.loop
 
+	;; triple the permutation and the reverse permutation;
+	;; see description at the beginning of the file for details
+	mov 	rsi, r8
+	call	triple
+	mov 	rsi, r9
+	call	triple
 	ret
 
 
@@ -300,12 +333,30 @@ process_t:
 	jne	error
 
 	;; increment the counter and if there are characters left, repeat
-	inc	ecx
-	cmp	ecx, ALPHABET_SIZE
+	inc	cl
+	cmp	cl, N
 	jne	.loop
 
+
+	;; triple the permutation;
+	;; see description at the beginning of the file for details
+	mov	rsi, tperm
+	call triple
 	ret
 
+
+;;; Copy the permutation in under the address in rsi
+;;; to the address rsi + N and rsi + 2N
+triple:
+	mov	rdi, rsi
+	add	rdi, N
+	mov	ecx, N
+	rep \
+	movsb
+	mov 	ecx, N
+	rep \
+	movsb
+	ret
 
 
 ;;; called in case of incorrect input, to exit with code 1
@@ -318,20 +369,15 @@ error:
 
 section .bss
 
-lperm:
-	resb	ALPHABET_SIZE
-
-lperm_rev:
-	resb	ALPHABET_SIZE
-
-rperm:
-	resb	ALPHABET_SIZE
-
-rperm_rev:
-	resb	ALPHABET_SIZE
-
-tperm:
-	resb	ALPHABET_SIZE
-
 buffer:
-	resb	BUFFER_SIZE
+	resb 	BUFFER_SIZE
+lperm:
+	resb 	3*N
+lperm_rev:
+	resb 	3*N
+rperm:
+	resb 	3*N
+rperm_rev:
+	resb 	3*N
+tperm:
+	resb 	3*N
